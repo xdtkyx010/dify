@@ -14,7 +14,6 @@ from server.timezone_assembly import TimezoneAssembly
 
 def create_app() -> Flask:
     dify_app = Flask(__name__)
-
     assemblies = [
         ConfigAssembly,
         TimezoneAssembly,
