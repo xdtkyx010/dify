@@ -1,4 +1,4 @@
-from flask_restful import Resource, marshal_with, reqparse
+from flask_restful import Resource, marshal_with  # type: ignore
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
