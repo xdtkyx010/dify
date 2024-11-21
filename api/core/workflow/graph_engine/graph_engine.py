@@ -5,13 +5,13 @@ import uuid
 from collections.abc import Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor, wait
 from copy import copy, deepcopy
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from flask import Flask, current_app
 
 from core.app.apps.base_app_queue_manager import GenerateTaskStoppedError
 from core.app.entities.app_invoke_entities import InvokeFrom
-from core.workflow.entities.node_entities import NodeRunMetadataKey
+from core.workflow.entities.node_entities import NodeRunMetadataKey, NodeRunResult
 from core.workflow.entities.variable_pool import VariablePool, VariableValue
 from core.workflow.graph_engine.condition_handlers.condition_manager import ConditionManager
 from core.workflow.graph_engine.entities.event import (
@@ -20,6 +20,7 @@ from core.workflow.graph_engine.entities.event import (
     GraphRunFailedEvent,
     GraphRunStartedEvent,
     GraphRunSucceededEvent,
+    NodeRunExceptionEvent,
     NodeRunFailedEvent,
     NodeRunRetrieverResourceEvent,
     NodeRunStartedEvent,
@@ -37,6 +38,7 @@ from core.workflow.nodes import NodeType
 from core.workflow.nodes.answer.answer_stream_processor import AnswerStreamProcessor
 from core.workflow.nodes.base import BaseNode
 from core.workflow.nodes.end.end_stream_processor import EndStreamProcessor
+from core.workflow.nodes.enums import ErrorStrategy
 from core.workflow.nodes.event import RunCompletedEvent, RunRetrieverResourceEvent, RunStreamChunkEvent
 from core.workflow.nodes.node_mapping import node_type_classes_mapping
 from extensions.ext_database import db
@@ -334,7 +336,7 @@ class GraphEngine:
                         if len(sub_edge_mappings) == 0:
                             continue
 
-                        edge = sub_edge_mappings[0]
+                        edge = cast(GraphEdge, sub_edge_mappings[0])
 
                         result = ConditionManager.get_condition_handler(
                             init_params=self.init_params,
@@ -587,19 +589,49 @@ class GraphEngine:
                         route_node_state.set_finished(run_result=run_result)
 
                         if run_result.status == WorkflowNodeExecutionStatus.FAILED:
-                            yield NodeRunFailedEvent(
-                                error=route_node_state.failed_reason or "Unknown error.",
-                                id=node_instance.id,
-                                node_id=node_instance.node_id,
-                                node_type=node_instance.node_type,
-                                node_data=node_instance.node_data,
-                                route_node_state=route_node_state,
-                                parallel_id=parallel_id,
-                                parallel_start_node_id=parallel_start_node_id,
-                                parent_parallel_id=parent_parallel_id,
-                                parent_parallel_start_node_id=parent_parallel_start_node_id,
-                            )
+                            if node_instance.should_continue_on_error:
+                                # if run failed, handle error
+                                run_result = self._handle_continue_on_error(
+                                    node_instance, item.run_result, self.graph_runtime_state.variable_pool
+                                )
+                                route_node_state.node_run_result = run_result
+                                if run_result.outputs:
+                                    for variable_key, variable_value in run_result.outputs.items():
+                                        # append variables to variable pool recursively
+                                        self._append_variables_recursively(
+                                            node_id=node_instance.node_id,
+                                            variable_key_list=[variable_key],
+                                            variable_value=variable_value,
+                                        )
+                                yield NodeRunExceptionEvent(
+                                    error=run_result.error or "System Error",
+                                    id=node_instance.id,
+                                    node_id=node_instance.node_id,
+                                    node_type=node_instance.node_type,
+                                    node_data=node_instance.node_data,
+                                    route_node_state=route_node_state,
+                                    parallel_id=parallel_id,
+                                    parallel_start_node_id=parallel_start_node_id,
+                                    parent_parallel_id=parent_parallel_id,
+                                    parent_parallel_start_node_id=parent_parallel_start_node_id,
+                                )
+                            else:
+                                yield NodeRunFailedEvent(
+                                    error=route_node_state.failed_reason or "Unknown error.",
+                                    id=node_instance.id,
+                                    node_id=node_instance.node_id,
+                                    node_type=node_instance.node_type,
+                                    node_data=node_instance.node_data,
+                                    route_node_state=route_node_state,
+                                    parallel_id=parallel_id,
+                                    parallel_start_node_id=parallel_start_node_id,
+                                    parent_parallel_id=parent_parallel_id,
+                                    parent_parallel_start_node_id=parent_parallel_start_node_id,
+                                )
+
                         elif run_result.status == WorkflowNodeExecutionStatus.SUCCEEDED:
+                            if node_instance.should_continue_on_error:
+                                run_result.edge_source_handle = "false"
                             if run_result.metadata and run_result.metadata.get(NodeRunMetadataKey.TOTAL_TOKENS):
                                 # plus state total_tokens
                                 self.graph_runtime_state.total_tokens += int(
@@ -632,18 +664,19 @@ class GraphEngine:
                                     run_result.metadata[NodeRunMetadataKey.PARENT_PARALLEL_START_NODE_ID] = (
                                         parent_parallel_start_node_id
                                     )
-
-                            yield NodeRunSucceededEvent(
-                                id=node_instance.id,
-                                node_id=node_instance.node_id,
-                                node_type=node_instance.node_type,
-                                node_data=node_instance.node_data,
-                                route_node_state=route_node_state,
-                                parallel_id=parallel_id,
-                                parallel_start_node_id=parallel_start_node_id,
-                                parent_parallel_id=parent_parallel_id,
-                                parent_parallel_start_node_id=parent_parallel_start_node_id,
-                            )
+                            event_args = {
+                                "id": node_instance.id,
+                                "node_id": node_instance.node_id,
+                                "node_type": node_instance.node_type,
+                                "node_data": node_instance.node_data,
+                                "route_node_state": route_node_state,
+                                "parallel_id": parallel_id,
+                                "parallel_start_node_id": parallel_start_node_id,
+                                "parent_parallel_id": parent_parallel_id,
+                                "parent_parallel_start_node_id": parent_parallel_start_node_id,
+                            }
+                            event = NodeRunSucceededEvent(**event_args)
+                            yield event
 
                         break
                     elif isinstance(item, RunStreamChunkEvent):
@@ -734,6 +767,35 @@ class GraphEngine:
         new_instance.graph_runtime_state = copy(self.graph_runtime_state)
         new_instance.graph_runtime_state.variable_pool = deepcopy(self.graph_runtime_state.variable_pool)
         return new_instance
+
+    def _handle_continue_on_error(
+        self, node_instance: BaseNode, error_result: NodeRunResult, variable_pool: VariablePool
+    ) -> NodeRunResult:
+        """
+        handle continue on error when self._should_continue_on_error is True
+
+        Args:
+            error_result (NodeRunResult): error run result
+            variable_pool (VariablePool): variable pool
+        Returns:
+            NodeRunResult: excption run result
+        """
+        # add error message and error type to variable pool
+        variable_pool.add([node_instance.node_id, "error_message"], error_result.error)
+        variable_pool.add([node_instance.node_id, "error_type"], error_result.error_type)
+
+        node_error_args = {
+            "status": WorkflowNodeExecutionStatus.EXCEPTION,
+            "error": error_result.error,
+            "inputs": error_result.inputs,
+        }
+        if node_instance.node_data.error_strategy is ErrorStrategy.DEFAULT_VALUE:
+            return NodeRunResult(
+                **node_error_args,
+                outputs=node_instance.node_data.default_value,
+            )
+
+        return NodeRunResult(**node_error_args, outputs=None, edge_source_handle="true")
 
 
 class GraphRunFailedError(Exception):
